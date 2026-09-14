@@ -35,6 +35,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         scheduleTabBarBackgroundSync()
     }
 
+
     override func becomeKey() {
         super.becomeKey()
         scheduleTabBarBackgroundSync()
@@ -83,6 +84,12 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
                 hideEffectView()
             }
         }
+
+        // Adding a tab rebuilds the tab bar lazily, after our KVO callbacks have
+        // already run. This runs once per event loop pass before display, so it is
+        // the earliest reliable point to fix the new bar up before it is drawn.
+        // The walk is small (one tab bar) and a no-op when nothing changed.
+        syncTabBarBackground()
     }
 
     // MARK: Appearance
@@ -149,6 +156,13 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     func syncTabBarBackground() {
         guard #available(macOS 27, *) else { return }
         guard let tabBarView else { return }
+
+        // We're poking raw CALayers, which pick up implicit animations. Without
+        // this the material fades out over 250ms every time AppKit rebuilds the
+        // tab bar, which reads as a flash of grey.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
 
         // The track material. AppKit can keep more than one track around while
         // animating, so walk the whole tab bar rather than the first match.
