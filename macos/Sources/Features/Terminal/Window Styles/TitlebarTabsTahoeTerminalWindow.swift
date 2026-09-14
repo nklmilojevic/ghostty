@@ -204,6 +204,10 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         clipView.needsLayout = true
         accessoryView.needsLayout = true
 
+        // Re-apply our background after relayout since AppKit may have rebuilt the
+        // accessory container (macOS 27 draws its own material there).
+        syncTabBarBackground()
+
         // Setup an observer for the NSTabBar frame. When system appearance changes or
         // other events occur, the tab bar can resize and clear our constraints. When this
         // happens, we need to remove our custom constraints and re-apply them once the

@@ -12,10 +12,12 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     private weak var observedTabGroup: NSWindowTabGroup?
     private var tabGroupWindowsObservation: NSKeyValueObservation?
     private var tabBarVisibleObservation: NSKeyValueObservation?
+    private var tabSelectionObservation: NSKeyValueObservation?
 
     deinit {
         tabGroupWindowsObservation?.invalidate()
         tabBarVisibleObservation?.invalidate()
+        tabSelectionObservation?.invalidate()
     }
 
     // MARK: NSWindow
@@ -28,8 +30,35 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         setupKVO()
     }
 
+    override func resignMain() {
+        super.resignMain()
+        scheduleTabBarBackgroundSync()
+    }
+
+    override func becomeKey() {
+        super.becomeKey()
+        scheduleTabBarBackgroundSync()
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        scheduleTabBarBackgroundSync()
+    }
+
+    /// AppKit restyles the native tab bar after key/main transitions and tab
+    /// selection changes, undoing our material fixes. Re-apply on the next
+    /// runloop turns.
+    private func scheduleTabBarBackgroundSync() {
+        syncTabBarBackground()
+        DispatchQueue.main.async { [weak self] in self?.syncTabBarBackground() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            self?.syncTabBarBackground()
+        }
+    }
+
     override func becomeMain() {
         super.becomeMain()
+        scheduleTabBarBackgroundSync()
 
         guard let lastSurfaceConfig else { return }
         syncAppearance(lastSurfaceConfig)
@@ -104,6 +133,125 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // In all cases, we have to hide the background view since this has multiple subviews
         // that force a background color.
         titlebarBackgroundView?.isHidden = true
+
+        syncTabBarBackground()
+    }
+
+    /// On macOS 27 the native tab bar draws a liquid glass pill: the track hosts a
+    /// blur backdrop plus a system-grey material fill, and each tab button renders
+    /// glass through a SwiftUI hosting view inside its `NSGlassEffectView`. Neither
+    /// honours the titlebar colour, so the tab strip stays grey regardless of the
+    /// terminal background. Hide the material layers and paint the selected tab
+    /// ourselves so the strip matches the terminal again.
+    ///
+    /// Safe to call repeatedly; AppKit rebuilds the tab bar often so this runs from
+    /// every appearance sync and after every tab bar layout.
+    func syncTabBarBackground() {
+        guard #available(macOS 27, *) else { return }
+        guard let tabBarView else { return }
+
+        // The track material. AppKit can keep more than one track around while
+        // animating, so walk the whole tab bar rather than the first match.
+        // The track also carries a thin rim drawn by its accessibility border view.
+        for border in tabBarView.descendants(withClassName: "NSView")
+        where border.identifier?.rawValue == "_tabBarAccessibilityBorderView" {
+            border.isHidden = true
+        }
+        if let root = tabBarView.layer {
+            Self.forEachLayer(in: root) { layer in
+                if layer.name == "NSTabBarTrackFilterHost" {
+                    layer.isHidden = true
+                    layer.opacity = 0
+                }
+            }
+        }
+
+        let selectedIndex: Int? = tabGroup.flatMap { group in
+            group.selectedWindow.flatMap { group.windows.firstIndex(of: $0) }
+        }
+        let highlight: CGColor? = preferredBackgroundColor.map { bg in
+            (bg.isLightColor ? bg.shadow(withLevel: 0.06) : bg.highlight(withLevel: 0.08))?.cgColor ?? bg.cgColor
+        }
+        let coverID = NSUserInterfaceItemIdentifier("_ghosttyTabGlassCover")
+
+        for (index, button) in tabButtonsInVisualOrder().enumerated() {
+            guard let glass = button.firstDescendant(withClassName: "NSGlassEffectView") else { continue }
+
+            // The glass renderer also portals the tab content through itself, so
+            // it can't be hidden outright. Hide only the layers that draw material.
+            for sub in glass.subviews where String(describing: type(of: sub)).hasPrefix("_NSCoreHostingView") {
+                if let layer = sub.layer {
+                    Self.hideGlassMaterial(in: layer)
+                    Self.releasePortalSources(in: layer)
+                }
+                sub.isHidden = true
+                sub.alphaValue = 0
+            }
+
+            // Our own selection highlight, beneath the tab content.
+            let cover: NSView
+            if let existing = glass.subviews.first(where: { $0.identifier == coverID }) {
+                cover = existing
+            } else {
+                cover = NSView(frame: glass.bounds)
+                cover.identifier = coverID
+                cover.wantsLayer = true
+                cover.translatesAutoresizingMaskIntoConstraints = false
+                glass.addSubview(cover, positioned: .below, relativeTo: glass.subviews.first)
+                NSLayoutConstraint.activate([
+                    cover.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
+                    cover.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
+                    cover.topAnchor.constraint(equalTo: glass.topAnchor),
+                    cover.bottomAnchor.constraint(equalTo: glass.bottomAnchor),
+                ])
+            }
+            if let coverLayer = cover.layer, let host = glass.layer, host.sublayers?.first !== coverLayer {
+                coverLayer.removeFromSuperlayer()
+                host.insertSublayer(coverLayer, at: 0)
+            }
+            cover.layer?.zPosition = -1
+            cover.layer?.cornerRadius = glass.bounds.height / 2
+            cover.layer?.backgroundColor = index == selectedIndex ? highlight : NSColor.clear.cgColor
+        }
+
+    }
+
+    private static func forEachLayer(in layer: CALayer, _ body: (CALayer) -> Void) {
+        body(layer)
+        for sub in layer.sublayers ?? [] { forEachLayer(in: sub, body) }
+    }
+
+    /// The glass renderer shows the tab content through a CAPortalLayer that hides
+    /// its source. Once we hide the renderer the content would vanish with it, so
+    /// let the source draw on its own again.
+    private static func releasePortalSources(in layer: CALayer) {
+        if NSStringFromClass(type(of: layer)).hasSuffix("PortalLayer"),
+           layer.responds(to: NSSelectorFromString("setHidesSourceLayer:")) {
+            layer.setValue(false, forKey: "hidesSourceLayer")
+        }
+        for sub in layer.sublayers ?? [] { releasePortalSources(in: sub) }
+    }
+
+    /// Hides material layers under a glass renderer while keeping the content portal.
+    /// Returns true when `layer` or any descendant is a portal layer.
+    @discardableResult
+    private static func hideGlassMaterial(in layer: CALayer) -> Bool {
+        let name = NSStringFromClass(type(of: layer))
+        if name.hasSuffix("PortalLayer") { return true }
+
+        var hasPortal = false
+        for sub in layer.sublayers ?? [] {
+            if hideGlassMaterial(in: sub) { hasPortal = true }
+        }
+        if hasPortal { return true }
+
+        if name == "CABackdropLayer"
+            || !(layer.filters ?? []).isEmpty
+            || name.contains("SDF") {
+            layer.isHidden = true
+            layer.opacity = 0
+        }
+        return false
     }
 
     @available(macOS 13.0, *)
@@ -150,6 +298,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             self.observedTabGroup = currentTabGroup
             self.setupTabGroupObservation()
             self.setupTabBarVisibleObservation()
+            self.setupTabSelectionObservation()
         }
     }
 
@@ -198,6 +347,24 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             guard let self else { return }
             guard let lastSurfaceConfig else { return }
             self.syncAppearance(lastSurfaceConfig)
+        }
+    }
+
+    /// Selecting a tab makes AppKit restyle the tab buttons over a short animation,
+    /// recreating the glass layers we neutralised. Re-apply a few times across it.
+    private func setupTabSelectionObservation() {
+        tabSelectionObservation?.invalidate()
+        tabSelectionObservation = nil
+        guard #available(macOS 27, *), let tabGroup else { return }
+
+        tabSelectionObservation = tabGroup.observe(\.selectedWindow, options: [.new]) { [weak self] _, _ in
+            guard let self else { return }
+            self.syncTabBarBackground()
+            for ms in [50, 150, 300, 600] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) { [weak self] in
+                    self?.syncTabBarBackground()
+                }
+            }
         }
     }
 
